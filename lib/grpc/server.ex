@@ -127,6 +127,7 @@ defmodule GRPC.Server do
       codecs = opts[:codecs] || [GRPC.Codec.Proto, GRPC.Codec.WebText, GRPC.Codec.JSON]
       compressors = opts[:compressors] || []
       http_transcode = opts[:http_transcode] || false
+      measurer = opts[:measurer] || nil
 
       codecs = if http_transcode, do: [GRPC.Codec.JSON | codecs], else: codecs
 
@@ -200,6 +201,7 @@ defmodule GRPC.Server do
       def __meta__(:codecs), do: unquote(codecs)
       def __meta__(:compressors), do: unquote(compressors)
       def __meta__(:routes), do: unquote(routes)
+      def __meta__(:measurer), do: unquote(measurer)
     end
   end
 
@@ -274,9 +276,12 @@ defmodule GRPC.Server do
   defp do_handle_request(
          false,
          res_stream,
-         %{request_mod: req_mod, codec: codec, adapter: adapter, payload: payload} = stream,
+         %{request_mod: req_mod, codec: codec, adapter: adapter, payload: payload, server: server} = stream,
          func_name
        ) do
+    measurer_module = server.__meta__(:measurer)
+    measurer_pid = Process.whereis(measurer_module)
+
     {:ok, data} = adapter.read_body(payload)
 
     body =
@@ -288,7 +293,12 @@ defmodule GRPC.Server do
 
     case GRPC.Message.from_data(stream, body) do
       {:ok, message} ->
-        request = codec.decode(message, req_mod)
+
+        {time, request} = :timer.tc(fn ->
+          codec.decode(message, req_mod)
+        end)
+
+        if measurer_pid, do: GenServer.cast(measurer_pid, {:grpc_decoded, time, byte_size(message), stream.request_id})
 
         call_with_interceptors(res_stream, func_name, stream, request)
 

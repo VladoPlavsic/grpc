@@ -322,8 +322,19 @@ defmodule GRPC.Stub do
          request,
          opts
        ) do
+    measurer_module = opts[:metadata][:measurer]
+    measurer_pid = Process.whereis(measurer_module)
+
     last = fn %{codec: codec, compressor: compressor} = s, _ ->
-      message = codec.encode(request)
+      {encoding_time, message} =
+        :timer.tc(fn ->
+          message = codec.encode(request)
+        end)
+
+      time = DateTime.utc_now |> DateTime.to_gregorian_seconds
+
+      if measurer_pid, do: GenServer.cast(measurer_pid, {:grpc_encoded, encoding_time, byte_size(message), time})
+
       opts = Keyword.put(opts, :compressor, compressor)
 
       s
