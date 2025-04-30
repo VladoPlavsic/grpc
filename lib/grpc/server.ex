@@ -298,7 +298,7 @@ defmodule GRPC.Server do
           codec.decode(message, req_mod)
         end)
 
-        if measurer_pid, do: GenServer.cast(measurer_pid, {:grpc_decoded, time, byte_size(message), stream.request_id})
+        if measurer_pid, do: GenServer.cast(measurer_pid, {:grpc_decoded, time, byte_size(message), request.unique_id})
 
         call_with_interceptors(res_stream, func_name, stream, request)
 
