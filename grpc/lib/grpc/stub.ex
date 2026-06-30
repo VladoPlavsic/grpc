@@ -207,6 +207,14 @@ defmodule GRPC.Stub do
     * `:lb_policy` - load-balancing policy (`:pick_first`, `:round_robin`)
     * `:name` - a stable identity for the connection; connecting again with
       the same name reuses the running connection
+    * `:pool` - connection pool options (map):
+      * `:size` - number of persistent connections (default: `1`)
+      * `:max_overflow` - max extra connections when pool is saturated; `nil` for no limit (default: `0`)
+      * `:max_streams` - max concurrent streams per connection; `nil` for no client-side limit (default: `nil`)
+      * `:health_check_enabled` - send periodic gRPC health-check pings (default: `false`)
+
+    The pool can be disabled entirely by setting `config :grpc, pool_enabled: false` in your
+    application config, which restores the pre-pool behaviour (single direct connection per `connect/2` call).
 
   For long-running clients, prefer declaring the connection in your
   supervision tree with `GRPC.Client.Connection` instead of calling
@@ -304,11 +312,11 @@ defmodule GRPC.Stub do
       raise ArgumentError, "accepted_compressors is not a list"
     end
 
-    case resolve_channel(channel, opts) do
+    case acquire_channel(channel, opts) do
       {:error, %GRPC.RPCError{} = error} ->
         unavailable_result(error, stream, request, req_mod, res_mod, req_stream, opts)
 
-      {:ok, ch} ->
+      {:ok, ch, pool_lease} ->
         compressor = Keyword.get(opts, :compressor, ch.compressor)
 
         accepted_compressors =
@@ -331,10 +339,48 @@ defmodule GRPC.Stub do
             accepted_compressors: accepted_compressors
         }
 
-        GRPC.Telemetry.client_span(stream, request, fn ->
-          do_call(req_stream, stream, request, opts)
-        end)
+        try do
+          GRPC.Telemetry.client_span(stream, request, fn ->
+            do_call(req_stream, stream, request, opts)
+          end)
+        after
+          release_channel(channel, pool_lease)
+        end
     end
+  end
+
+  defp acquire_channel(%Channel{pool: nil} = channel, opts) do
+    case resolve_channel(channel, opts) do
+      {:ok, ch} -> {:ok, ch, nil}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp acquire_channel(%Channel{pool: pool_ref} = channel, opts) do
+    # Always go through pick_channel so the LB can rotate between address pools
+    actual_pool_ref =
+      case Connection.pick_channel(channel, opts) do
+        {:ok, %Channel{pool: picked_pool_ref}} when is_reference(picked_pool_ref) ->
+          picked_pool_ref
+
+        _ ->
+          pool_ref
+      end
+
+    case GRPC.Client.Pool.checkout(actual_pool_ref) do
+      {wrapped, actual_channel} ->
+        {:ok, actual_channel, {wrapped, actual_pool_ref}}
+
+      nil ->
+        {:error,
+         GRPC.RPCError.exception(GRPC.Status.resource_exhausted(), "no pool channel available")}
+    end
+  end
+
+  defp release_channel(_channel, nil), do: :ok
+
+  defp release_channel(_channel, {wrapped_channel, pool_ref}) do
+    GRPC.Client.Pool.checkin(pool_ref, wrapped_channel)
   end
 
   # Bounded re-picks let rotating policies advance past a dead entry during
