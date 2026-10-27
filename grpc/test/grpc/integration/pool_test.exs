@@ -34,6 +34,27 @@ defmodule GRPC.Integration.PoolTest do
     end
   end
 
+  defmodule StreamingServer do
+    use GRPC.Server, service: Routeguide.RouteGuide.Service
+
+    def list_features(_rect, stream) do
+      Enum.each(1..5, fn i ->
+        GRPC.Server.send_reply(stream, %Routeguide.Feature{name: "Feature #{i}"})
+      end)
+    end
+
+    def record_route(req_enum, _stream) do
+      count = Enum.count(req_enum)
+      %Routeguide.RouteSummary{point_count: count}
+    end
+
+    def route_chat(req_enum, stream) do
+      Enum.each(req_enum, fn note ->
+        GRPC.Server.send_reply(stream, note)
+      end)
+    end
+  end
+
   test "RPC calls work through the pool" do
     run_server(HelloServer, fn port ->
       {:ok, channel} = GRPC.Stub.connect("localhost:#{port}")
@@ -383,6 +404,223 @@ defmodule GRPC.Integration.PoolTest do
       assert disconnected.pool == nil
 
       refute Process.alive?(sup_pid)
+    end)
+  end
+
+  test "server streaming retains pool lease until stream enumeration completes" do
+    run_server(StreamingServer, fn port ->
+      {:ok, channel} = GRPC.Stub.connect("localhost:#{port}", pool: %{size: 1, max_streams: 1})
+      pool_ref = channel.pool
+
+      [{pool_pid, _}] =
+        Registry.lookup(GRPC.Client.Pool.Registry, {GRPC.Client.Pool.Server, pool_ref})
+
+      rect = %Routeguide.Rectangle{lo: %Routeguide.Point{}, hi: %Routeguide.Point{}}
+      {:ok, stream} = Routeguide.RouteGuide.Stub.list_features(channel, rect)
+
+      # Before stream is consumed, lease MUST be held (open_streams == 1)
+      state = :sys.get_state(pool_pid)
+      assert Enum.any?(state.channels, fn {_, ch} -> ch.open_streams == 1 end)
+
+      # Attempting another call should be resource_exhausted because max_streams is 1
+      assert {:error, %GRPC.RPCError{status: status}} =
+               Routeguide.RouteGuide.Stub.list_features(channel, rect)
+
+      assert status == GRPC.Status.resource_exhausted()
+
+      # Consume the stream
+      features = Enum.to_list(stream)
+      assert length(features) == 5
+
+      # After stream is consumed, lease is released (open_streams == 0)
+      state = :sys.get_state(pool_pid)
+      assert Enum.all?(state.channels, fn {_, ch} -> ch.open_streams == 0 end)
+      assert map_size(state.leases_by_monitor_ref) == 0
+
+      # Now a new call succeeds
+      assert {:ok, _} = Routeguide.RouteGuide.Stub.list_features(channel, rect)
+    end)
+  end
+
+  test "server streaming early halt (Stream.take) releases pool lease" do
+    run_server(StreamingServer, fn port ->
+      {:ok, channel} = GRPC.Stub.connect("localhost:#{port}", pool: %{size: 1, max_streams: 1})
+      pool_ref = channel.pool
+
+      [{pool_pid, _}] =
+        Registry.lookup(GRPC.Client.Pool.Registry, {GRPC.Client.Pool.Server, pool_ref})
+
+      rect = %Routeguide.Rectangle{lo: %Routeguide.Point{}, hi: %Routeguide.Point{}}
+      {:ok, stream} = Routeguide.RouteGuide.Stub.list_features(channel, rect)
+
+      state = :sys.get_state(pool_pid)
+      assert Enum.any?(state.channels, fn {_, ch} -> ch.open_streams == 1 end)
+
+      # Halt early with Stream.take
+      [feature] = stream |> Stream.take(1) |> Enum.to_list()
+      assert feature == {:ok, %Routeguide.Feature{name: "Feature 1"}}
+
+      # Lease should be released
+      state = :sys.get_state(pool_pid)
+      assert Enum.all?(state.channels, fn {_, ch} -> ch.open_streams == 0 end)
+      assert map_size(state.leases_by_monitor_ref) == 0
+    end)
+  end
+
+  test "server streaming consumed in Task.async releases pool lease across processes" do
+    run_server(StreamingServer, fn port ->
+      {:ok, channel} = GRPC.Stub.connect("localhost:#{port}", pool: %{size: 1, max_streams: 1})
+      pool_ref = channel.pool
+
+      [{pool_pid, _}] =
+        Registry.lookup(GRPC.Client.Pool.Registry, {GRPC.Client.Pool.Server, pool_ref})
+
+      rect = %Routeguide.Rectangle{lo: %Routeguide.Point{}, hi: %Routeguide.Point{}}
+      # Initiated in parent process
+      {:ok, stream} = Routeguide.RouteGuide.Stub.list_features(channel, rect)
+
+      state = :sys.get_state(pool_pid)
+      assert Enum.any?(state.channels, fn {_, ch} -> ch.open_streams == 1 end)
+
+      # Consumed in Task.async
+      task = Task.async(fn -> Enum.to_list(stream) end)
+      features = Task.await(task)
+      assert length(features) == 5
+
+      # Lease released despite being consumed and checked in by Task PID
+      state = :sys.get_state(pool_pid)
+      assert Enum.all?(state.channels, fn {_, ch} -> ch.open_streams == 0 end)
+      assert map_size(state.leases_by_monitor_ref) == 0
+    end)
+  end
+
+  test "multiple concurrent streams in same process track leases independently" do
+    run_server(StreamingServer, fn port ->
+      {:ok, channel} = GRPC.Stub.connect("localhost:#{port}", pool: %{size: 1, max_streams: 5})
+      pool_ref = channel.pool
+
+      [{pool_pid, _}] =
+        Registry.lookup(GRPC.Client.Pool.Registry, {GRPC.Client.Pool.Server, pool_ref})
+
+      rect = %Routeguide.Rectangle{lo: %Routeguide.Point{}, hi: %Routeguide.Point{}}
+      {:ok, stream1} = Routeguide.RouteGuide.Stub.list_features(channel, rect)
+      {:ok, stream2} = Routeguide.RouteGuide.Stub.list_features(channel, rect)
+
+      state = :sys.get_state(pool_pid)
+      assert Enum.any?(state.channels, fn {_, ch} -> ch.open_streams == 2 end)
+      assert map_size(state.leases_by_monitor_ref) == 2
+
+      # Consuming stream1 releases only 1 lease
+      Enum.to_list(stream1)
+      state = :sys.get_state(pool_pid)
+      assert Enum.any?(state.channels, fn {_, ch} -> ch.open_streams == 1 end)
+      assert map_size(state.leases_by_monitor_ref) == 1
+
+      # Consuming stream2 releases the second lease
+      Enum.to_list(stream2)
+      state = :sys.get_state(pool_pid)
+      assert Enum.all?(state.channels, fn {_, ch} -> ch.open_streams == 0 end)
+      assert map_size(state.leases_by_monitor_ref) == 0
+    end)
+  end
+
+  test "client streaming retains lease until recv/2 completes" do
+    run_server(StreamingServer, fn port ->
+      {:ok, channel} = GRPC.Stub.connect("localhost:#{port}", pool: %{size: 1, max_streams: 1})
+      pool_ref = channel.pool
+
+      [{pool_pid, _}] =
+        Registry.lookup(GRPC.Client.Pool.Registry, {GRPC.Client.Pool.Server, pool_ref})
+
+      stream = Routeguide.RouteGuide.Stub.record_route(channel)
+
+      state = :sys.get_state(pool_pid)
+      assert Enum.any?(state.channels, fn {_, ch} -> ch.open_streams == 1 end)
+
+      point = %Routeguide.Point{latitude: 1, longitude: 2}
+      stream = GRPC.Stub.send_request(stream, point)
+      stream = GRPC.Stub.send_request(stream, point)
+      stream = GRPC.Stub.end_stream(stream)
+
+      # Still held before recv
+      state = :sys.get_state(pool_pid)
+      assert Enum.any?(state.channels, fn {_, ch} -> ch.open_streams == 1 end)
+
+      assert {:ok, %Routeguide.RouteSummary{point_count: 2}} = GRPC.Stub.recv(stream)
+
+      # Released after recv
+      state = :sys.get_state(pool_pid)
+      assert Enum.all?(state.channels, fn {_, ch} -> ch.open_streams == 0 end)
+      assert map_size(state.leases_by_monitor_ref) == 0
+    end)
+  end
+
+  test "client streaming cancel/1 releases pool lease" do
+    run_server(StreamingServer, fn port ->
+      {:ok, channel} = GRPC.Stub.connect("localhost:#{port}", pool: %{size: 1, max_streams: 1})
+      pool_ref = channel.pool
+
+      [{pool_pid, _}] =
+        Registry.lookup(GRPC.Client.Pool.Registry, {GRPC.Client.Pool.Server, pool_ref})
+
+      stream = Routeguide.RouteGuide.Stub.record_route(channel)
+
+      state = :sys.get_state(pool_pid)
+      assert Enum.any?(state.channels, fn {_, ch} -> ch.open_streams == 1 end)
+
+      assert %GRPC.Client.Stream{canceled: true} = GRPC.Stub.cancel(stream)
+
+      state = :sys.get_state(pool_pid)
+      assert Enum.all?(state.channels, fn {_, ch} -> ch.open_streams == 0 end)
+      assert map_size(state.leases_by_monitor_ref) == 0
+    end)
+  end
+
+  test "overflow connections are reaped and disconnected when returning to idle" do
+    run_server(SlowServer, fn port ->
+      {:ok, channel} =
+        GRPC.Stub.connect("localhost:#{port}", pool: %{size: 1, max_overflow: 1, max_streams: 1})
+
+      pool_ref = channel.pool
+
+      [{pool_pid, _}] =
+        Registry.lookup(GRPC.Client.Pool.Registry, {GRPC.Client.Pool.Server, pool_ref})
+
+      client_pid = self()
+
+      task1 =
+        Task.async(fn ->
+          Helloworld.Greeter.Stub.loop_back(channel, %Helloworld.LoopBackRequest{
+            client_pid: :erlang.term_to_binary(client_pid),
+            client_msg: :erlang.term_to_binary(:holding_1),
+            client_name: "1"
+          })
+        end)
+
+      assert_receive :holding_1
+
+      task2 =
+        Task.async(fn ->
+          Helloworld.Greeter.Stub.loop_back(channel, %Helloworld.LoopBackRequest{
+            client_pid: :erlang.term_to_binary(client_pid),
+            client_msg: :erlang.term_to_binary(:holding_2),
+            client_name: "2"
+          })
+        end)
+
+      assert_receive :holding_2
+
+      # Overflow channel is created -> 2 channels total
+      state = :sys.get_state(pool_pid)
+      assert map_size(state.channels) == 2
+
+      assert {:ok, _} = Task.await(task1, 2_000)
+      assert {:ok, _} = Task.await(task2, 2_000)
+
+      # Once tasks complete and return, excess channels are reaped back to pool_size (1)
+      state = :sys.get_state(pool_pid)
+      assert map_size(state.channels) == 1
+      assert Enum.all?(state.channels, fn {_, ch} -> ch.open_streams == 0 end)
     end)
   end
 end
