@@ -83,19 +83,28 @@ defmodule GRPC.Client.Pool.Server do
 
   @impl GenServer
   def handle_call(:take_channel, {caller_pid, _tag} = _from, state) do
-    {channel, _monitor_ref, state} = Implementation.take_channel(state, caller_pid)
-    {:reply, channel, state}
+    case Implementation.take_channel(state, caller_pid) do
+      {nil, _monitor_ref, state} -> {:reply, nil, state}
+      {channel, monitor_ref, state} -> {:reply, {channel, monitor_ref}, state}
+    end
   end
 
   @impl GenServer
   def handle_call({:take_channel, channel_id}, {caller_pid, _tag} = _from, state) do
-    {channel, _maybe_monitor_ref, state} =
-      Implementation.take_channel(state, channel_id, caller_pid)
-
-    {:reply, channel, state}
+    case Implementation.take_channel(state, channel_id, caller_pid) do
+      {nil, _monitor_ref, state} -> {:reply, nil, state}
+      {channel, monitor_ref, state} -> {:reply, {channel, monitor_ref}, state}
+    end
   end
 
   @impl GenServer
+  def handle_cast({:return_channel, _wrapped_channel, monitor_ref}, state)
+      when is_reference(monitor_ref) do
+    {state, _ref} = Implementation.return_channel(state, monitor_ref)
+    Process.demonitor(monitor_ref, [:flush])
+    {:noreply, state}
+  end
+
   def handle_cast({:return_channel, wrapped_channel, caller_pid}, state) do
     {state, monitor_ref} = Implementation.return_channel(state, wrapped_channel, caller_pid)
     if monitor_ref, do: Process.demonitor(monitor_ref, [:flush])

@@ -151,66 +151,95 @@ defmodule GRPC.Client.Pool.Implementation do
       nil ->
         {state, monitor_ref}
 
-      %State.Lease{id: id, caller_pid: caller_pid} ->
+      %State.Lease{id: id} ->
         channel = Map.fetch!(state.channels, id)
-        return_channel(state, channel, caller_pid)
+        return_channel(state, channel, monitor_ref)
     end
   end
 
-  @spec return_channel(State.t(), State.Channel.t(), pid()) :: {State.t(), reference() | nil}
+  @spec return_channel(State.t(), State.Channel.t(), pid() | reference()) ::
+          {State.t(), reference() | nil}
   def return_channel(
         %State{channels: channels} = state,
         %State.Channel{} = wrapped_channel,
-        caller_pid
+        ref_or_pid
       ) do
     channels
     |> Map.has_key?(wrapped_channel.id)
-    |> maybe_return_channel(state, wrapped_channel, caller_pid)
+    |> maybe_return_channel(state, wrapped_channel, ref_or_pid)
   end
 
   defp maybe_return_channel(
          true = _channel_in_state,
          %State{} = state,
          %State.Channel{} = wrapped_channel,
-         caller_pid
+         ref_or_pid
        ) do
     state
-    |> decrement_open_streams_count(wrapped_channel)
-    |> remove_lease_from_leases_by_channel_id(wrapped_channel, caller_pid)
+    |> remove_lease_from_leases_by_channel_id(wrapped_channel, ref_or_pid)
     |> remove_lease_from_leases_by_monitor_ref()
+    |> maybe_reap_channel(wrapped_channel)
   end
 
   defp maybe_return_channel(
          false = _channel_in_state,
          %State{} = state,
          _wrapped_channel,
-         _caller_pid
+         _ref_or_pid
        ) do
     {state, nil}
   end
 
   defp decrement_open_streams_count(%State{} = state, channel) do
-    update_in(state, [:channels, channel.id, :open_streams], &(&1 - 1))
+    update_in(state, [:channels, channel.id, :open_streams], &max(0, &1 - 1))
   end
 
   defp remove_lease_from_leases_by_channel_id(
          %State{leases_by_channel_id: leases} = state,
          channel,
-         caller_pid
+         ref_or_pid
        ) do
     old_leases = Map.get(leases, channel.id, [])
-    old_lease = Enum.find(old_leases, fn %State.Lease{caller_pid: pid} -> pid == caller_pid end)
 
-    new_leases = List.delete(old_leases, old_lease)
+    matcher =
+      if is_reference(ref_or_pid) do
+        fn %State.Lease{monitor_ref: ref} -> ref == ref_or_pid end
+      else
+        fn %State.Lease{caller_pid: pid} -> pid == ref_or_pid end
+      end
 
-    {put_in(state, [:leases_by_channel_id, channel.id], new_leases),
-     old_lease && old_lease.monitor_ref}
+    case Enum.find(old_leases, matcher) do
+      nil ->
+        {state, nil}
+
+      old_lease ->
+        new_leases = List.delete(old_leases, old_lease)
+        state = decrement_open_streams_count(state, channel)
+        {put_in(state, [:leases_by_channel_id, channel.id], new_leases), old_lease.monitor_ref}
+    end
   end
 
   defp remove_lease_from_leases_by_monitor_ref(
          {%State{leases_by_monitor_ref: leases} = state, monitor_ref}
        ) do
     {%{state | leases_by_monitor_ref: Map.delete(leases, monitor_ref)}, monitor_ref}
+  end
+
+  defp maybe_reap_channel({state, monitor_ref}, %State.Channel{id: channel_id}) do
+    case Map.get(state.channels, channel_id) do
+      %State.Channel{open_streams: 0} = ch
+      when map_size(state.channels) > state.config.pool_size ->
+        ch.channel.adapter.disconnect(ch.channel)
+        if ch.monitor_ref, do: Process.demonitor(ch.monitor_ref, [:flush])
+
+        new_channels = Map.delete(state.channels, channel_id)
+        new_leases = Map.delete(state.leases_by_channel_id, channel_id)
+
+        {%{state | channels: new_channels, leases_by_channel_id: new_leases}, monitor_ref}
+
+      _ ->
+        {state, monitor_ref}
+    end
   end
 
   @spec take_channel(State.t(), pid()) :: {State.Channel.t(), reference(), State.t()}

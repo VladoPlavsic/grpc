@@ -196,22 +196,43 @@ defmodule GRPC.Client.Pool.ImplementationTest do
              } = state
     end
 
-    test "returning a channel removes from leases by monitor ref", %{state: state} do
-      {channels, state, [expected_pid1, expected_pid2, expected_pid3],
-       [expected_ref1, expected_ref2, expected_ref3]} =
-        take_channels_n_times(3, state)
+    test "reaps channel with 0 open streams when channels count exceeds pool_size", %{port: port} do
+      config = %{
+        make_config(port)
+        | pool_size: 1,
+          max_pool_overflow: 1,
+          max_client_streams_per_connection: 1
+      }
 
-      [%State.Channel{id: channel_id} = channel] =
-        Enum.uniq_by(channels, fn %State.Channel{id: id} -> id end)
+      state = @subject.init(%State{config: config})
+      assert map_size(state.channels) == 1
 
-      assert {state, ^expected_ref1} = @subject.return_channel(state, channel, expected_pid1)
+      pid1 = spawn(fn -> Process.sleep(1000) end)
+      pid2 = spawn(fn -> Process.sleep(1000) end)
 
-      assert %State{
-               leases_by_monitor_ref: %{
-                 ^expected_ref2 => %State.Lease{id: ^channel_id, caller_pid: ^expected_pid2},
-                 ^expected_ref3 => %State.Lease{id: ^channel_id, caller_pid: ^expected_pid3}
-               }
-             } = state
+      {_channel1, _ref1, state} = @subject.take_channel(state, pid1)
+      {channel2, ref2, state} = @subject.take_channel(state, pid2)
+
+      assert map_size(state.channels) == 2
+
+      {state, ^ref2} = @subject.return_channel(state, channel2, pid2)
+      assert map_size(state.channels) == 1
+      refute Map.has_key?(state.channels, channel2.id)
+    end
+
+    test "returning a channel using monitor_ref works even when caller_pid is different (e.g. Task.async)",
+         %{port: port} do
+      config = %{make_config(port) | pool_size: 1, max_client_streams_per_connection: 10}
+      state = @subject.init(%State{config: config})
+
+      parent_pid = spawn(fn -> Process.sleep(1000) end)
+      {channel, monitor_ref, state} = @subject.take_channel(state, parent_pid)
+      assert state.channels[channel.id].open_streams == 1
+
+      assert {state, ^monitor_ref} = @subject.return_channel(state, channel, monitor_ref)
+      assert state.channels[channel.id].open_streams == 0
+      assert state.leases_by_channel_id[channel.id] == []
+      assert state.leases_by_monitor_ref == %{}
     end
   end
 
